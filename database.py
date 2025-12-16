@@ -8,13 +8,65 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 from threading import Lock
 
-
 _DATABASE_URL = os.getenv('DATABASE_URL', '').strip()
 _USING_POSTGRES = _DATABASE_URL.lower().startswith('postgres://') or _DATABASE_URL.lower().startswith('postgresql://')
 
 if _USING_POSTGRES:
     import psycopg2
     import psycopg2.extras
+    from psycopg2 import pool
+
+# Global connection pool for PostgreSQL
+_pg_pool: Optional[pool.SimpleConnectionPool] = None
+_pool_lock = Lock()
+
+
+def initialize_pool():
+    """Initialize PostgreSQL connection pool. Call once at startup."""
+    global _pg_pool
+    if not _USING_POSTGRES:
+        return  # No pool needed for SQLite
+    
+    with _pool_lock:
+        if _pg_pool is None:
+            try:
+                _pg_pool = pool.SimpleConnectionPool(
+                    minconn=2,
+                    maxconn=20,
+                    dsn=_DATABASE_URL,
+                    sslmode='require'
+                )
+                print(f"✓ PostgreSQL connection pool initialized (2-20 connections)")
+            except TypeError:
+                # Fallback if sslmode not supported
+                _pg_pool = pool.SimpleConnectionPool(
+                    minconn=2,
+                    maxconn=20,
+                    dsn=_DATABASE_URL
+                )
+                print(f"✓ PostgreSQL connection pool initialized (2-20 connections, no SSL)")
+
+
+def close_pool():
+    global _pg_pool
+    with _pool_lock:
+        if _pg_pool is not None:
+            _pg_pool.closeall()
+            _pg_pool = None
+
+
+def get_conn():
+    if _USING_POSTGRES:
+        return _pg_pool.getconn()
+    else:
+        return sqlite3.connect(DB_FILE)
+
+
+def release_conn(conn):
+    if _USING_POSTGRES:
+        _pg_pool.putconn(conn)
+    else:
+        conn.close()
 
 
 def _qmark_to_percent_s(query: str) -> str:
@@ -85,8 +137,9 @@ class _PgCompatCursor:
 
 
 class _PgCompatConnection:
-    def __init__(self, conn):
+    def __init__(self, conn, from_pool=False):
         self._conn = conn
+        self._from_pool = from_pool
         self.row_factory = None
 
     def cursor(self):
@@ -99,19 +152,28 @@ class _PgCompatConnection:
     def commit(self):
         return self._conn.commit()
 
+    def rollback(self):
+        return self._conn.rollback()
+
     def close(self):
-        return self._conn.close()
+        """Return connection to pool or close if not from pool."""
+        if self._from_pool:
+            # Return to pool instead of closing
+            if _pg_pool is not None:
+                _pg_pool.putconn(self._conn)
+        else:
+            return self._conn.close()
 
 
 if _USING_POSTGRES:
     _sqlite_connect_original = sqlite3.connect
 
     def _pg_connect(_ignored_db_file=None, timeout=None, **_kwargs):
-        try:
-            conn = psycopg2.connect(_DATABASE_URL, sslmode='require')
-        except TypeError:
-            conn = psycopg2.connect(_DATABASE_URL)
-        return _PgCompatConnection(conn)
+        """Get connection from pool and wrap it for SQLite compatibility."""
+        if _pg_pool is None:
+            raise RuntimeError("Connection pool not initialized. Call initialize_pool() first.")
+        raw_conn = _pg_pool.getconn()
+        return _PgCompatConnection(raw_conn, from_pool=True)
 
     sqlite3.connect = _pg_connect  # type: ignore[assignment]
     sqlite3.IntegrityError = psycopg2.IntegrityError  # type: ignore[attr-defined]
@@ -1048,12 +1110,12 @@ def get_today_sessions(today_iso_date: str):
         cursor.execute(
             '''
             SELECT s.*, 
-                   COALESCE(u_reg.name, u2.full_name, '?') as display_name,
+                   COALESCE(u_reg.name, u2.full_name, '-') as display_name,
                    u2.full_name
             FROM sessions s
             JOIN users2 u2 ON s.user_id = u2.id
             LEFT JOIN users u_reg ON u2.telegram_id = u_reg.telegram_id
-            WHERE s.start_time::date = ?::date
+            WHERE s.start_time::date = %s::date
             ORDER BY s.id DESC
             ''',
             (today_iso_date,)
