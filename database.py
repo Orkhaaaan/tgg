@@ -382,6 +382,7 @@ def register_user(telegram_id: int, name: str, fin: str, seriya: str, code: str)
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
+        # is_active defaults to TRUE/1 in schema, no need to specify
         cursor.execute(
             'INSERT INTO users (telegram_id, name, fin, seriya, code) VALUES (?, ?, ?, ?, ?)',
             (telegram_id, name, fin, seriya, code)
@@ -405,6 +406,10 @@ def get_user_by_telegram_id(telegram_id: int) -> Optional[dict]:
     conn.close()
 
     if row:
+        # Normalize is_active to Python bool (Postgres returns bool, SQLite returns 0/1)
+        is_active_val = row[7] if len(row) > 7 else True
+        if isinstance(is_active_val, int):
+            is_active_val = bool(is_active_val)
         return {
             'id': row[0],
             'telegram_id': row[1],
@@ -413,7 +418,7 @@ def get_user_by_telegram_id(telegram_id: int) -> Optional[dict]:
             'seriya': row[4],
             'code': row[5],
             'phone_number': row[6] if len(row) > 6 else None,
-            'is_active': row[7] if len(row) > 7 else 1
+            'is_active': is_active_val
         }
     return None
 
@@ -423,14 +428,14 @@ def upsert_user_profile(telegram_id: int, name: str, fin: str, code: str, seriya
     with _db_lock:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        # Try insert first
+        # Try insert first (is_active defaults to TRUE/1 in schema)
         try:
             cursor.execute(
                 'INSERT INTO users (telegram_id, name, fin, seriya, code, phone_number) VALUES (?, ?, ?, ?, ?, ?)',
                 (telegram_id, name, fin, seriya, code, phone_number)
             )
         except sqlite3.IntegrityError:
-            # Update existing
+            # Update existing (don't touch is_active on profile update)
             cursor.execute(
                 'UPDATE users SET name = ?, fin = ?, seriya = ?, code = ?, phone_number = ? WHERE telegram_id = ?',
                 (name, fin, seriya, code, phone_number, telegram_id)
@@ -1396,9 +1401,10 @@ def set_user_active(telegram_id: int, is_active: bool) -> bool:
     with _db_lock:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
+        active_value = bool(is_active) if _USING_POSTGRES else (1 if is_active else 0)
         cursor.execute(
             'UPDATE users SET is_active = ? WHERE telegram_id = ?',
-            (is_active if _USING_POSTGRES else (1 if is_active else 0), telegram_id)
+            (active_value, telegram_id)
         )
     
         affected = cursor.rowcount
