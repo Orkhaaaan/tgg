@@ -3426,6 +3426,9 @@ async def main() -> None:
             # If setting scoped commands fails, ignore so bot still works
             pass
 
+    # Initialize PostgreSQL connection pool (must be before any DB operations)
+    db.initialize_pool()
+
     # Ensure DB schema exists before handling any updates
     db.init_db()
     db.init_gps_tables()
@@ -3436,7 +3439,10 @@ async def main() -> None:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     except TelegramConflictError:
         print("TelegramConflictError: eyni BOT_TOKEN ilə başqa bot instansiyası işləyir. Digər prosesi/dayployment-i dayandırın.")
-        return
+    finally:
+        # Clean up connection pool on shutdown
+        db.close_pool()
+        print("✓ Database connection pool closed")
 
 
 if __name__ == "__main__":
