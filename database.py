@@ -18,7 +18,38 @@ if _USING_POSTGRES:
 
 
 def _qmark_to_percent_s(query: str) -> str:
-    return query.replace('?', '%s')
+    # Replace qmark placeholders with psycopg2 %s placeholders, but avoid touching
+    # question marks inside SQL string literals (e.g. COALESCE(col, '?')).
+    out: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(query):
+        ch = query[i]
+        if ch == "'" and not in_double:
+            # Handle escaped single quote inside single-quoted strings: ''
+            if in_single and i + 1 < len(query) and query[i + 1] == "'":
+                out.append("''")
+                i += 2
+                continue
+            in_single = not in_single
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == '?' and not in_single and not in_double:
+            out.append('%s')
+            i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+    return ''.join(out)
 
 
 class _PgCompatCursor:
