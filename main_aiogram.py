@@ -3426,6 +3426,12 @@ async def main() -> None:
             # If setting scoped commands fails, ignore so bot still works
             pass
 
+    # Ensure DB schema exists before handling any updates
+    db.init_db()
+    db.init_gps_tables()
+    db.init_group_codes()
+    db.init_registrations()
+
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     except TelegramConflictError:
