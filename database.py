@@ -428,18 +428,32 @@ def upsert_user_profile(telegram_id: int, name: str, fin: str, code: str, seriya
     with _db_lock:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        # Try insert first (is_active defaults to TRUE/1 in schema)
-        try:
+        if _USING_POSTGRES:
             cursor.execute(
-                'INSERT INTO users (telegram_id, name, fin, seriya, code, phone_number) VALUES (?, ?, ?, ?, ?, ?)',
+                'INSERT INTO users (telegram_id, name, fin, seriya, code, phone_number) '
+                'VALUES (?, ?, ?, ?, ?, ?) '
+                'ON CONFLICT (telegram_id) DO UPDATE SET '
+                'name = EXCLUDED.name, '
+                'fin = EXCLUDED.fin, '
+                'seriya = EXCLUDED.seriya, '
+                'code = EXCLUDED.code, '
+                'phone_number = EXCLUDED.phone_number',
                 (telegram_id, name, fin, seriya, code, phone_number)
             )
-        except sqlite3.IntegrityError:
-            # Update existing (don't touch is_active on profile update)
-            cursor.execute(
-                'UPDATE users SET name = ?, fin = ?, seriya = ?, code = ?, phone_number = ? WHERE telegram_id = ?',
-                (name, fin, seriya, code, phone_number, telegram_id)
-            )
+        else:
+            # Try insert first (is_active defaults to TRUE/1 in schema)
+            try:
+                cursor.execute(
+                    'INSERT INTO users (telegram_id, name, fin, seriya, code, phone_number) VALUES (?, ?, ?, ?, ?, ?)',
+                    (telegram_id, name, fin, seriya, code, phone_number)
+                )
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                # Update existing (don't touch is_active on profile update)
+                cursor.execute(
+                    'UPDATE users SET name = ?, fin = ?, seriya = ?, code = ?, phone_number = ? WHERE telegram_id = ?',
+                    (name, fin, seriya, code, phone_number, telegram_id)
+                )
         conn.commit()
         conn.close()
 
@@ -646,14 +660,14 @@ def get_attendance_logs(date: Optional[str] = None, profession: Optional[str] = 
     cursor = conn.cursor()
     base = (
         'SELECT a.date, u.name, u.fin, u.code, '
-        "COALESCE(r.profession, '-') AS profession, "
+        'COALESCE(r.profession, ?) AS profession, '
         'a.giris_time, a.cixis_time, a.giris_loc, a.cixis_loc '
         'FROM attendance a '
         'JOIN users u ON a.user_id = u.id '
         'LEFT JOIN registrations r ON r.user_id = u.id AND r.date = a.date '
     )
 
-    params: list = []
+    params: list = ['-']
     conds: list[str] = []
     if date:
         conds.append('a.date = ?')
@@ -664,6 +678,7 @@ def get_attendance_logs(date: Optional[str] = None, profession: Optional[str] = 
     if code:
         conds.append('u.code = ?')
         params.append(code)
+
     if conds:
         base += ' WHERE ' + ' AND '.join(conds)
     base += ' ORDER BY a.date DESC, r.profession, u.name'
