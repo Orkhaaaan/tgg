@@ -31,20 +31,20 @@ def initialize_pool():
         if _pg_pool is None:
             try:
                 _pg_pool = pool.SimpleConnectionPool(
-                    minconn=2,
-                    maxconn=20,
+                    minconn=5,
+                    maxconn=100,  # Increased for high load (1000+ users)
                     dsn=_DATABASE_URL,
                     sslmode='require'
                 )
-                print(f"✓ PostgreSQL connection pool initialized (2-20 connections)")
+                print(f"✓ PostgreSQL connection pool initialized (5-100 connections)")
             except TypeError:
                 # Fallback if sslmode not supported
                 _pg_pool = pool.SimpleConnectionPool(
-                    minconn=2,
-                    maxconn=20,
+                    minconn=5,
+                    maxconn=100,  # Increased for high load (1000+ users)
                     dsn=_DATABASE_URL
                 )
-                print(f"✓ PostgreSQL connection pool initialized (2-20 connections, no SSL)")
+                print(f"✓ PostgreSQL connection pool initialized (5-100 connections, no SSL)")
 
 
 def close_pool():
