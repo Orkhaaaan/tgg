@@ -1,13 +1,15 @@
 import asyncio
 import atexit
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import re
 import time
 import requests
+import aiohttp
 import shlex
 import urllib.parse
 import sqlite3
+from zoneinfo import ZoneInfo
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
@@ -36,6 +38,7 @@ from utils.distance import haversine_m
 from utils import notifications
 from utils.reports import check_rules_violation, get_status_color, get_status_name
 from utils.exports import generate_csv_report
+from utils.geocoding import reverse_geocode, reverse_geocode_background
 import csv
 
 # ================== KONFİQURASİYA ==================
@@ -99,9 +102,6 @@ LOCATION_TIMEOUT = 120
 # Telegram mesaj limitindən bir az aşağı saxlayırıq
 TG_CHUNK_LIMIT = 3500
 
-# Nominatim üçün User-Agent (öz kontaktını yaza bilərsən)
-NOMINATIM_UA = "tgbotcuk/1.0 (contact: admin@example.com)"
-
 # Məkən koordinatları (lat, lon) və radius (metrlə)
 WORKPLACE_LAT = float(os.getenv("WORKPLACE_LAT", "40.4093"))  # Baku koordinatları default
 WORKPLACE_LON = float(os.getenv("WORKPLACE_LON", "49.8671"))
@@ -115,6 +115,26 @@ MIN_WORK_DURATION_HOURS = 3  # Minimum iş müddəti (saat)
 # Lokasiya dəqiqliyi (metrlə) - eyni yer sayılması üçün tolerance
 LOCATION_TOLERANCE_M = 50  # 50 metr tolerance
 
+try:
+    BAKU_TZ = ZoneInfo("Asia/Baku")
+except Exception:
+    BAKU_TZ = timezone(timedelta(hours=4))
+
+
+def now_baku() -> datetime:
+    return datetime.now(BAKU_TZ)
+
+
+def today_baku() -> str:
+    return now_baku().date().isoformat()
+
+
+def parse_dt_to_baku(value: str) -> datetime:
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(BAKU_TZ)
+
 # ================== GLOBAL OBYEKTLƏR ==================
 
 bot = Bot(token=BOT_TOKEN)
@@ -123,9 +143,6 @@ dp = Dispatcher()
 # In-memory pending action per user: (action, ts)
 # action: "checkin" | "checkout", ts: unix timestamp
 pending_action: dict[int, tuple[str, float]] = {}
-
-# Simple in-memory cache for reverse geocoding results
-_addr_cache: dict[tuple[float, float], str] = {}
 
 PROFESSIONS: list[str] = [
     "Aşpaz",
@@ -193,72 +210,6 @@ class AdminManageStudent(StatesGroup):
 
 # ================== KÖMƏKÇİ FUNKSİYALAR ==================
 
-def reverse_geocode(lat: float, lon: float) -> str:
-    """Koordinatlardan ünvanı tapır (Nominatim + cache). Tam adres adını qaytarır."""
-    key = (round(lat, 6), round(lon, 6))
-    if key in _addr_cache:
-        return _addr_cache[key]
-
-    try:
-        resp = requests.get(
-            "https://nominatim.openstreetmap.org/reverse",
-            params={"format": "jsonv2", "lat": lat, "lon": lon, "zoom": 18, "addressdetails": 1},
-            headers={"User-Agent": NOMINATIM_UA},
-            timeout=10,
-        )
-        if resp.ok:
-            data = resp.json()
-            # First try display_name (full address)
-            addr = data.get("display_name") or ""
-            if addr:
-                _addr_cache[key] = addr
-                return addr
-            
-            # If display_name is empty, construct address from address components
-            address = data.get("address", {})
-            if isinstance(address, dict):
-                # Build address from components: road, house_number, city, etc.
-                parts = []
-                
-                # Road/street name (küçə adı)
-                road = address.get("road") or address.get("street") or address.get("pedestrian") or address.get("path")
-                if road:
-                    parts.append(road)
-                
-                # House number if available
-                house_number = address.get("house_number")
-                if house_number:
-                    parts.append(house_number)
-                
-                # City/district
-                city = address.get("city") or address.get("town") or address.get("village") or address.get("municipality")
-                if city and city not in parts:
-                    parts.append(city)
-                
-                # If we have at least road name, return it
-                if parts:
-                    full_addr = ", ".join(parts)
-                    _addr_cache[key] = full_addr
-                    return full_addr
-                
-                # Try other location names
-                suburb = address.get("suburb") or address.get("neighbourhood")
-                if suburb:
-                    _addr_cache[key] = suburb
-                    return suburb
-                    
-                # Last resort: any named place
-                place = address.get("place")
-                if place:
-                    _addr_cache[key] = place
-                    return place
-    except Exception as e:
-        # Railway loglarında görmək üçün
-        print(f"[reverse_geocode] error: {e}")
-
-    # If nothing found, return empty string so caller can use coordinates as fallback
-    return ""
-
 
 def is_admin(user_id: int) -> bool:
     return ADMIN_ID != 0 and user_id == ADMIN_ID
@@ -325,7 +276,7 @@ def _parse_date_or_today(s: str) -> str | None:
     """'YYYY-MM-DD' və ya 'bugun' tipini tarixə çevirir, yanlış olsa None qaytarır."""
     s = s.strip().lower()
     if s in ("bugun", "bu gun", "bu gün"):
-        return datetime.now().date().isoformat()
+        return today_baku()
     try:
         dt = datetime.strptime(s, "%Y-%m-%d")
         return dt.date().isoformat()
@@ -597,18 +548,16 @@ def generate_daily_excel_report(date: str) -> str:
                 lat = float(start_lat)
                 lon = float(start_lon)
                 gps_coords = f"{lat}, {lon}"
-                addr_result = reverse_geocode(lat, lon)
-                # If reverse geocode fails, use coordinates as address
-                address = addr_result if addr_result else gps_coords
+                # Sync context: use coordinates (geocoding cache is async-only)
+                address = gps_coords
                 start_link = f"https://maps.google.com/?q={lat},{lon}"
             elif end_lat is not None and end_lon is not None:
                 # Fallback to end location if start not available
                 lat = float(end_lat)
                 lon = float(end_lon)
                 gps_coords = f"{lat}, {lon}"
-                addr_result = reverse_geocode(lat, lon)
-                # If reverse geocode fails, use coordinates as address
-                address = addr_result if addr_result else gps_coords
+                # Sync context: use coordinates (geocoding cache is async-only)
+                address = gps_coords
                 end_link = f"https://maps.google.com/?q={lat},{lon}"
             else:
                 # Fallback to legacy attendance location fields
@@ -780,7 +729,7 @@ async def handle_start(message: Message, state: FSMContext) -> None:
         if last_reg_date:
             try:
                 last_reg = datetime.strptime(last_reg_date, "%Y-%m-%d").date()
-                today = datetime.now().date()
+                today = now_baku().date()
                 days_passed = (today - last_reg).days
                 
                 # If more than 4 months (approximately 120 days) passed, reset user
@@ -850,7 +799,7 @@ async def reg_pick_profession(message: Message, state: FSMContext) -> None:
 
     await state.update_data(profession=chosen)
     await state.set_state(Reg.code)
-    today = datetime.now().date().isoformat()
+    today = today_baku()
     await message.answer(
         f"Peşə: {chosen}\nİndi isə bu günün kodunu daxil edin ({today})",
         reply_markup=ReplyKeyboardRemove(),
@@ -866,7 +815,7 @@ async def reg_enter_code(message: Message, state: FSMContext) -> None:
         await state.set_state(Reg.profession)
         await message.answer("Əvvəl peşə seçin.", reply_markup=professions_keyboard())
         return
-    today = datetime.now().date().isoformat()
+    today = today_baku()
     valid = db.get_code_for(profession=prof, date=today)
     if not valid or valid != code:
         await message.answer("❌ Kod yanlışdır. Yenidən cəhd edin.")
@@ -999,7 +948,7 @@ async def reg_enter_phone_number(message: Message, state: FSMContext) -> None:
 
     # Fetch user row to get users.id
     prof = db.get_user_by_telegram_id(user.id)
-    today = datetime.now().date().isoformat()
+    today = today_baku()
 
     # Duplicate protection for same user + profession + code + date
     if prof and isinstance(prof.get("id"), int):
@@ -1063,7 +1012,7 @@ async def cmd_bugun(message: Message) -> None:
     db.init_db()
     db.init_gps_tables()
 
-    today = datetime.now().date().isoformat()
+    today = today_baku()
 
     # Legacy attendance (users table) summary
     att = db.get_todays_attendance(today)
@@ -1112,7 +1061,7 @@ async def cmd_bugun(message: Message) -> None:
                 try:
                     s_lat = float(start_lat)
                     s_lon = float(start_lon)
-                    s_addr = reverse_geocode(s_lat, s_lon)
+                    s_addr = await reverse_geocode(s_lat, s_lon)
                     s_link = f"https://maps.google.com/?q={s_lat},{s_lon}"
                     # Ünvan tapılmazsa mətni göstərmə, yalnız linki göstər
                     if s_addr and s_addr.strip() and s_addr.strip().lower() != "lokasiya tapılmadı":
@@ -1131,7 +1080,7 @@ async def cmd_bugun(message: Message) -> None:
                 try:
                     e_lat = float(end_lat)
                     e_lon = float(end_lon)
-                    e_addr = reverse_geocode(e_lat, e_lon)
+                    e_addr = await reverse_geocode(e_lat, e_lon)
                     e_link = f"https://maps.google.com/?q={e_lat},{e_lon}"
                     if e_addr and e_addr.strip() and e_addr.strip().lower() != "lokasiya tapılmadı":
                         block.append(f"     📍 {e_addr}")
@@ -1159,7 +1108,7 @@ async def btn_isciler(message: Message) -> None:
         return
     db.init_db()
     workers = db.get_all_workers_status()
-    today = datetime.now().date().isoformat()
+    today = today_baku()
     db.init_group_codes()
     active_rows = db.get_group_codes(date=today, only_active=True)
     active_codes = {r.get('code') for r in active_rows}
@@ -1207,7 +1156,7 @@ async def btn_menu(message: Message) -> None:
     
     # Get statistics
     stats = db.get_total_registered_students()
-    today = datetime.now().date().isoformat()
+    today = today_baku()
     active_today = db.get_active_students_count(today)
     
     lines = [
@@ -1289,7 +1238,7 @@ async def adminadd_enter_code(message: Message, state: FSMContext) -> None:
     profession = data.get("profession")
     date = data.get("date")  # Check if date is in state (from AdminManageGroup)
     if not date:
-        today = datetime.now().date().isoformat()
+        today = today_baku()
     else:
         today = date
     db.init_group_codes()
@@ -1324,7 +1273,7 @@ async def btn_view_codes(message: Message) -> None:
     if not user or not is_admin(user.id):
         await message.answer("❌ Bu əməliyyat yalnız admin üçündür.")
         return
-    today = datetime.now().date().isoformat()
+    today = today_baku()
     db.init_group_codes()
     rows = db.get_group_codes(date=today, only_active=None)
     if not rows:
@@ -1342,7 +1291,7 @@ async def btn_regs_today(message: Message) -> None:
     if not user or not is_admin(user.id):
         await message.answer("❌ Bu əməliyyat yalnız admin üçündür.")
         return
-    today = datetime.now().date().isoformat()
+    today = today_baku()
     rows = db.get_registrations(date=today)
     if not rows:
         await message.answer("Bu gün qeydiyyat yoxdur.")
@@ -1417,7 +1366,7 @@ async def btn_logs_today(message: Message) -> None:
     if not user or not is_admin(user.id):
         await message.answer("❌ Bu əməliyyat yalnız admin üçündür.")
         return
-    today = datetime.now().date().isoformat()
+    today = today_baku()
     rows = db.get_attendance_logs(date=today)
     if not rows:
         await message.answer("Bu gün üçün log yoxdur.")
@@ -1442,9 +1391,10 @@ async def btn_report_code(message: Message, state: FSMContext) -> None:
     if not user or not is_admin(user.id):
         await message.answer("❌ Bu əməliyyat yalnız admin üçündür.")
         return
+    
     await state.clear()
     await state.set_state(AdminReportByCode.date)
-    today = datetime.now().date().isoformat()
+    today = today_baku()
     await message.answer(
         f"Tarixi daxil edin (YYYY-MM-DD). Məs: {today}",
         reply_markup=ReplyKeyboardRemove(),
@@ -1544,14 +1494,14 @@ async def admin_period_type(message: Message, state: FSMContext) -> None:
     
     if period_type == "daily":
         await state.set_state(AdminPeriodReport.start_date)
-        today = datetime.now().date().isoformat()
+        today = today_baku()
         await message.answer(
             f"📅 Tarixi daxil edin (YYYY-MM-DD). Məs: {today} və ya 'bugun'",
             reply_markup=ReplyKeyboardRemove()
         )
     elif period_type in ["weekly", "monthly", "range"]:
         await state.set_state(AdminPeriodReport.start_date)
-        today = datetime.now().date().isoformat()
+        today = today_baku()
         await message.answer(
             f"📅 Başlanğıc tarixi daxil edin (YYYY-MM-DD). Məs: {today}",
             reply_markup=ReplyKeyboardRemove()
@@ -1594,7 +1544,7 @@ async def admin_period_start_date(message: Message, state: FSMContext) -> None:
         )
     else:
         await state.set_state(AdminPeriodReport.end_date)
-        today = datetime.now().date().isoformat()
+        today = today_baku()
         await message.answer(
             f"📅 Bitiş tarixini daxil edin (YYYY-MM-DD). Məs: {today}",
             reply_markup=ReplyKeyboardRemove()
@@ -1640,7 +1590,7 @@ async def admin_period_code(message: Message, state: FSMContext) -> None:
     
     await state.update_data(code=code)
     await state.set_state(AdminPeriodReport.start_date)
-    today = datetime.now().date().isoformat()
+    today = today_baku()
     await message.answer(
         f"📅 Başlanğıc tarixi daxil edin (YYYY-MM-DD). Məs: {today}",
         reply_markup=ReplyKeyboardRemove()
@@ -1772,7 +1722,8 @@ async def admin_period_format(message: Message, state: FSMContext) -> None:
 
                 if lat is not None and lon is not None:
                     row['gps_coords'] = f"{lat}, {lon}"
-                    row['address'] = reverse_geocode(lat, lon)
+                    # Sync context: use coordinates (geocoding cache is async-only)
+                    row['address'] = row['gps_coords']
                     row['maps_link'] = f"https://maps.google.com/?q={lat},{lon}"
                 else:
                     # Fallback to legacy location text fields
@@ -1973,9 +1924,8 @@ def generate_period_excel_report(report_data: List[dict], start_date: str, end_d
                             lon = float(end_lon)
                         if lat is not None and lon is not None:
                             gps_coords = f"{lat}, {lon}"
-                            addr_result = reverse_geocode(lat, lon)
-                            # If reverse geocode fails, use coordinates as address
-                            address = addr_result if addr_result else gps_coords
+                            # Sync context: use coordinates (geocoding cache is async-only)
+                            address = gps_coords
                             maps_link = f"https://maps.google.com/?q={lat},{lon}"
                         else:
                             giris_loc = (member.get('giris_loc') or '').strip()
@@ -2066,7 +2016,7 @@ async def cmd_excel(message: Message) -> None:
             await message.answer("❌ Tarix formatı düzgün deyil. YYYY-MM-DD və ya 'bugun' yazın.")
             return
     else:
-        date = datetime.now().date().isoformat()
+        date = today_baku()
     
     try:
         await message.answer(f"📊 {date} üçün Excel hesabatı hazırlanır...")
@@ -2369,7 +2319,7 @@ async def admin_manage_group_action(message: Message, state: FSMContext) -> None
         await message.answer("Silinəcək kod üçün peşə seçin:", reply_markup=professions_keyboard())
     elif text == "📋 Qrup kodlarını göstər":
         await state.clear()
-        today = datetime.now().date().isoformat()
+        today = today_baku()
         db.init_group_codes()
         rows = db.get_group_codes(date=today, only_active=None)
         if not rows:
@@ -2905,7 +2855,7 @@ async def handle_giris(message: Message) -> None:
     try:
         db.init_gps_tables()
         uid = db.get_or_create_user2(telegram_id=user_id, full_name=user.full_name)
-        today = datetime.now().date().isoformat()
+        today = today_baku()
         existing = db.get_user_session_on_date(uid, today)
         if existing:
             await message.answer("ℹ️ Bu gün artıq giriş etmisiniz.", reply_markup=worker_keyboard())
@@ -2952,8 +2902,8 @@ async def handle_cixis(message: Message) -> None:
         else:
             # Early safeguard: do not even prompt for location if 3 hours not passed
             try:
-                start_time = datetime.fromisoformat(sess["start_time"])  # type: ignore[index]
-                now = datetime.now()
+                start_time = parse_dt_to_baku(sess["start_time"])  # type: ignore[index]
+                now = now_baku()
                 duration_hours = (now - start_time).total_seconds() / 3600.0
                 duration_min = max(0, int((now - start_time).total_seconds() // 60))
                 if duration_hours < MIN_WORK_DURATION_HOURS:
@@ -3045,7 +2995,7 @@ async def handle_location(message: Message) -> None:
 
         uid = db.get_or_create_user2(telegram_id=user_id, full_name=user.full_name)
 
-        now = datetime.now()
+        now = now_baku()
         now_iso = now.isoformat(timespec="seconds")
         today = now.date().isoformat()
 
@@ -3120,12 +3070,13 @@ async def handle_location(message: Message) -> None:
             prof = db.get_user_by_telegram_id(user_id)
             name = (prof.get("name") if prof else user.full_name) or "Istifadəçi"
             code = prof.get("code") if prof else None
-            addr = reverse_geocode(lat, lon)
+            
+            # Cavabı dərhal göndər (adres yüklənməsini gözləmə)
             info_lines = [
                 "✅ Giriş qeyd olundu",
                 f"👤 {name}" + (f" | Kod: {code}" if code else ""),
                 f"📅 {today}  ⏰ {now.strftime('%H:%M:%S')}",
-                f"📍 {addr}",
+                f"📍 Koordinatlar: {lat}, {lon}",
             ]
             await message.answer("\n".join(info_lines))
             await message.answer("📍 Başlanğıc nöqtəsi", reply_markup=kb)
@@ -3141,7 +3092,7 @@ async def handle_location(message: Message) -> None:
             
             await message.answer("Menyu:", reply_markup=worker_keyboard())
 
-            # Legacy attendance
+            # Legacy attendance (save without address initially)
             try:
                 if prof and isinstance(prof.get("id"), int):
                     legacy_user_id = int(prof["id"])  # type: ignore[index]
@@ -3149,10 +3100,32 @@ async def handle_location(message: Message) -> None:
                         user_id=legacy_user_id,
                         date=today,
                         time=now.strftime("%H:%M:%S"),
-                        location=addr,
+                        location=None,  # Will be updated by background task if geocoding enabled
                     )
             except Exception as e:
                 print(f"[handle_location checkin legacy] {e}")
+            
+            # Background geocoding task (non-blocking)
+            async def send_address():
+                try:
+                    addr = await reverse_geocode(lat, lon)
+                    if addr:
+                        await message.answer(f"📍 Ünvan: {addr}")
+                        # Update legacy attendance with address
+                        if prof and isinstance(prof.get("id"), int):
+                            legacy_user_id = int(prof["id"])
+                            conn = db.sqlite3.connect(db.DB_FILE)
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                'UPDATE attendance SET giris_loc = ? WHERE user_id = ? AND date = ?',
+                                (addr, legacy_user_id, today)
+                            )
+                            conn.commit()
+                            conn.close()
+                except Exception as e:
+                    print(f"[send_address checkin] {e}")
+            
+            asyncio.create_task(send_address())
 
             # Schedule reminder after 8 hours
             asyncio.create_task(schedule_checkout_reminder(user_id, now, uid))
@@ -3207,7 +3180,7 @@ async def handle_location(message: Message) -> None:
                 return
 
             # Compute metrics
-            start_time = datetime.fromisoformat(sess["start_time"])  # type: ignore[index]
+            start_time = parse_dt_to_baku(sess["start_time"])  # type: ignore[index]
             duration_hours = (now - start_time).total_seconds() / 3600.0
             duration_min = max(0, int((now - start_time).total_seconds() // 60))
             
@@ -3338,12 +3311,13 @@ async def handle_location(message: Message) -> None:
             prof = db.get_user_by_telegram_id(user_id)
             name = (prof.get("name") if prof else user.full_name) or "Istifadəçi"
             code = prof.get("code") if prof else None
-            end_addr = reverse_geocode(lat, lon)
+            
+            # Cavabı dərhal göndər
             info_lines = [
                 "✅ Çıxış qeyd olundu",
                 f"👤 {name}" + (f" | Kod: {code}" if code else ""),
                 f"📅 {today}  ⏰ {now.strftime('%H:%M:%S')}",
-                f"📍 {end_addr}",
+                f"📍 Koordinatlar: {lat}, {lon}",
                 f"⏱ İş müddəti: {duration_min} dəqiqə ({duration_hours:.1f} saat)",
             ]
             await message.answer("\n".join(info_lines))
@@ -3366,10 +3340,32 @@ async def handle_location(message: Message) -> None:
                         user_id=legacy_user_id,
                         date=today,
                         time=now.strftime("%H:%M:%S"),
-                        location=end_addr,
+                        location=None,
                     )
             except Exception as e:
                 print(f"[handle_location checkout legacy] {e}")
+            
+            # Background geocoding task (non-blocking)
+            async def send_address():
+                try:
+                    end_addr = await reverse_geocode(lat, lon)
+                    if end_addr:
+                        await message.answer(f"📍 Ünvan: {end_addr}")
+                        # Update legacy attendance with address
+                        if prof and isinstance(prof.get("id"), int):
+                            legacy_user_id = int(prof["id"])
+                            conn = db.sqlite3.connect(db.DB_FILE)
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                'UPDATE attendance SET cixis_loc = ? WHERE user_id = ? AND date = ?',
+                                (end_addr, legacy_user_id, today)
+                            )
+                            conn.commit()
+                            conn.close()
+                except Exception as e:
+                    print(f"[send_address checkout] {e}")
+            
+            asyncio.create_task(send_address())
 
             pending_action.pop(user_id, None)
             return
