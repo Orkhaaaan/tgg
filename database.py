@@ -646,12 +646,13 @@ def get_attendance_logs(date: Optional[str] = None, profession: Optional[str] = 
     cursor = conn.cursor()
     base = (
         'SELECT a.date, u.name, u.fin, u.code, '
-        'COALESCE(r.profession, "-") AS profession, '
+        "COALESCE(r.profession, '-') AS profession, "
         'a.giris_time, a.cixis_time, a.giris_loc, a.cixis_loc '
         'FROM attendance a '
         'JOIN users u ON a.user_id = u.id '
-        'LEFT JOIN registrations r ON r.user_id = u.id AND r.date = a.date'
+        'LEFT JOIN registrations r ON r.user_id = u.id AND r.date = a.date '
     )
+
     params: list = []
     conds: list[str] = []
     if date:
