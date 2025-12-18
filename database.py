@@ -17,7 +17,7 @@ if _USING_POSTGRES:
     from psycopg2 import pool
 
 # Global connection pool for PostgreSQL
-_pg_pool: Optional[pool.SimpleConnectionPool] = None
+_pg_pool: Optional["pool.SimpleConnectionPool"] = None
 _pool_lock = Lock()
 
 
@@ -756,6 +756,23 @@ def add_registration(user_id: int, date: str, profession: str, code: str) -> boo
         return False
 
 
+def get_registrations_summary(date: str) -> List[dict]:
+    """Return counts of registrations grouped by profession+code for a specific date."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT profession, code, COUNT(*) AS cnt '
+        'FROM registrations WHERE date = ? '
+        'GROUP BY profession, code '
+        'ORDER BY profession, code',
+        (date,)
+    )
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
 def get_registrations(date: Optional[str] = None, profession: Optional[str] = None, code: Optional[str] = None) -> List[dict]:
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -806,6 +823,51 @@ def init_group_codes() -> None:
         try:
             cursor = conn.cursor()
             cursor.execute('PRAGMA busy_timeout=5000')
+
+            # Migrate old schema that enforced UNIQUE(profession, date) to allow multiple codes
+            # per profession per day (UNIQUE(profession, date, code)).
+            if not _USING_POSTGRES:
+                try:
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='group_codes'")
+                    exists = cursor.fetchone() is not None
+                    if exists:
+                        cursor.execute("PRAGMA index_list('group_codes')")
+                        idx_rows = cursor.fetchall() or []
+                        needs_migration = False
+                        for idx in idx_rows:
+                            # PRAGMA index_list: (seq, name, unique, origin, partial)
+                            idx_name = idx[1]
+                            is_unique = bool(idx[2])
+                            if not is_unique:
+                                continue
+                            cursor.execute(f"PRAGMA index_info('{idx_name}')")
+                            cols = [r[2] for r in (cursor.fetchall() or [])]
+                            if cols == ["profession", "date"]:
+                                needs_migration = True
+                                break
+
+                        if needs_migration:
+                            cursor.execute(
+                                '''
+                                CREATE TABLE IF NOT EXISTS group_codes__new (
+                                    id INTEGER PRIMARY KEY,
+                                    profession TEXT NOT NULL,
+                                    date TEXT NOT NULL,
+                                    code TEXT NOT NULL,
+                                    is_active INTEGER NOT NULL DEFAULT 1,
+                                    UNIQUE(profession, date, code)
+                                )
+                                '''
+                            )
+                            cursor.execute(
+                                'INSERT OR IGNORE INTO group_codes__new (id, profession, date, code, is_active) '
+                                'SELECT id, profession, date, code, is_active FROM group_codes'
+                            )
+                            cursor.execute('DROP TABLE group_codes')
+                            cursor.execute('ALTER TABLE group_codes__new RENAME TO group_codes')
+                except Exception:
+                    # If migration fails for any reason, continue and rely on new installs.
+                    pass
             cursor.execute(
                 '''
                 CREATE TABLE IF NOT EXISTS group_codes (
@@ -814,7 +876,7 @@ def init_group_codes() -> None:
                     date {date_type} NOT NULL,
                     code TEXT NOT NULL,
                     is_active {active_type} NOT NULL DEFAULT {active_default},
-                    UNIQUE(profession, date)
+                    UNIQUE(profession, date, code)
                 )
                 '''
                 .format(
@@ -832,14 +894,14 @@ def init_group_codes() -> None:
 
 
 def add_group_code(profession: str, date: str, code: str, is_active: int = 1) -> bool:
-    """Insert or replace daily code for a profession+date. Returns True on success."""
+    """Insert (or update) code for a profession+date. Allows multiple codes per day."""
     with _db_lock:
         try:
             conn = sqlite3.connect(DB_FILE, timeout=10)
             try:
                 cursor = conn.cursor()
                 cursor.execute('PRAGMA busy_timeout=5000')
-                # Try insert; if exists, update
+                # Try insert; if exists, update active flag for the same (profession,date,code)
                 cursor.execute(
                     'INSERT INTO group_codes (profession, date, code, is_active) VALUES (?, ?, ?, ?)',
                     (profession, date, code, (bool(is_active) if _USING_POSTGRES else (1 if is_active else 0)))
@@ -849,14 +911,14 @@ def add_group_code(profession: str, date: str, code: str, is_active: int = 1) ->
             finally:
                 conn.close()
         except sqlite3.IntegrityError:
-            # Update existing
+            # Update existing row for the same (profession,date,code)
             conn = sqlite3.connect(DB_FILE, timeout=10)
             try:
                 cursor = conn.cursor()
                 cursor.execute('PRAGMA busy_timeout=5000')
                 cursor.execute(
-                    'UPDATE group_codes SET code = ?, is_active = ? WHERE profession = ? AND date = ?',
-                    (code, (bool(is_active) if _USING_POSTGRES else (1 if is_active else 0)), profession, date)
+                    'UPDATE group_codes SET is_active = ? WHERE profession = ? AND date = ? AND code = ?',
+                    ((bool(is_active) if _USING_POSTGRES else (1 if is_active else 0)), profession, date, code)
                 )
                 conn.commit()
                 return True
@@ -864,7 +926,7 @@ def add_group_code(profession: str, date: str, code: str, is_active: int = 1) ->
                 conn.close()
 
 
-def set_group_code_active(profession: str, date: str, is_active: int) -> bool:
+def set_group_code_active(profession: str, date: str, code: str, is_active: int) -> bool:
     """Toggle active flag. Returns True if a row was affected."""
     with _db_lock:
         conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -872,8 +934,8 @@ def set_group_code_active(profession: str, date: str, is_active: int) -> bool:
             cursor = conn.cursor()
             cursor.execute('PRAGMA busy_timeout=5000')
             cursor.execute(
-                'UPDATE group_codes SET is_active = ? WHERE profession = ? AND date = ?',
-                ((bool(is_active) if _USING_POSTGRES else (1 if is_active else 0)), profession, date)
+                'UPDATE group_codes SET is_active = ? WHERE profession = ? AND date = ? AND code = ?',
+                ((bool(is_active) if _USING_POSTGRES else (1 if is_active else 0)), profession, date, code)
             )
             affected = cursor.rowcount
             conn.commit()
@@ -882,16 +944,16 @@ def set_group_code_active(profession: str, date: str, is_active: int) -> bool:
             conn.close()
 
 
-def delete_group_code(profession: str, date: str) -> bool:
-    """Delete group code for a given profession and date. Returns True if a row was deleted."""
+def delete_group_code(profession: str, date: str, code: str) -> bool:
+    """Delete a specific group code for a given profession and date."""
     with _db_lock:
         conn = sqlite3.connect(DB_FILE, timeout=10)
         try:
             cursor = conn.cursor()
             cursor.execute('PRAGMA busy_timeout=5000')
             cursor.execute(
-                'DELETE FROM group_codes WHERE profession = ? AND date = ?',
-                (profession, date)
+                'DELETE FROM group_codes WHERE profession = ? AND date = ? AND code = ?',
+                (profession, date, code)
             )
             affected = cursor.rowcount
             conn.commit()
@@ -928,19 +990,47 @@ def get_group_codes(date: Optional[str] = None, only_active: Optional[bool] = No
             conn.close()
 
 
+def get_codes_for(profession: str, date: Optional[str] = None, only_active: bool = True) -> List[str]:
+    """List codes for a profession, optionally filtered by date, optionally only active."""
+    with _db_lock:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        try:
+            cursor = conn.cursor()
+            cursor.execute('PRAGMA busy_timeout=5000')
+            query = 'SELECT code FROM group_codes WHERE profession = ?'
+            params: list = [profession]
+            if date is not None:
+                query += ' AND date = ?'
+                params.append(date)
+            if only_active:
+                query += ' AND is_active = {active}'.format(active='TRUE' if _USING_POSTGRES else '1')
+            query += ' ORDER BY date DESC, code'
+            cursor.execute(query, tuple(params))
+            return [r[0] for r in (cursor.fetchall() or [])]
+        finally:
+            conn.close()
+
+
 def get_code_for(profession: str, date: str) -> Optional[str]:
-    """Return code for a given profession and date if exists (ignore active flag)."""
+    """Back-compat: return the latest code for a given profession and date if exists."""
+    codes = get_codes_for(profession=profession, date=date, only_active=False)
+    return codes[0] if codes else None
+
+
+def is_group_code_valid(profession: str, code: str) -> bool:
+    """Check if a code exists for the profession and is active (date-independent)."""
     with _db_lock:
         conn = sqlite3.connect(DB_FILE, timeout=10)
         try:
             cursor = conn.cursor()
             cursor.execute('PRAGMA busy_timeout=5000')
             cursor.execute(
-                'SELECT code FROM group_codes WHERE profession = ? AND date = ?',
-                (profession, date)
+                'SELECT 1 FROM group_codes WHERE profession = ? AND code = ? AND is_active = {active} LIMIT 1'.format(
+                    active='TRUE' if _USING_POSTGRES else '1'
+                ),
+                (profession, code)
             )
-            row = cursor.fetchone()
-            return row[0] if row else None
+            return cursor.fetchone() is not None
         finally:
             conn.close()
 
