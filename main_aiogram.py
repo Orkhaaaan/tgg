@@ -110,7 +110,7 @@ WORKPLACE_RADIUS_M = float(os.getenv("WORKPLACE_RADIUS_M", "100"))  # 100 metr d
 # Giriş-çıxış vaxt məhdudiyyətləri
 CHECKIN_DEADLINE_HOUR = 11  # Giriş 11:00-a qədər
 CHECKOUT_DEADLINE_HOUR = 19  # Çıxış 19:00-a qədər
-MIN_WORK_DURATION_HOURS = 3  # Minimum iş müddəti (saat)
+MIN_WORK_DURATION_HOURS = 6  # Minimum iş müddəti (saat)
 
 # Lokasiya dəqiqliyi (metrlə) - eyni yer sayılması üçün tolerance
 LOCATION_TOLERANCE_M = 50  # 50 metr tolerance
@@ -815,9 +815,8 @@ async def reg_enter_code(message: Message, state: FSMContext) -> None:
         await state.set_state(Reg.profession)
         await message.answer("Əvvəl peşə seçin.", reply_markup=professions_keyboard())
         return
-    today = today_baku()
-    valid = db.get_code_for(profession=prof, date=today)
-    if not valid or valid != code:
+    db.init_group_codes()
+    if not db.is_group_code_valid(profession=prof, code=code):
         await message.answer("❌ Kod yanlışdır. Yenidən cəhd edin.")
         return
     await state.update_data(code=code)
@@ -853,16 +852,16 @@ async def reg_enter_document_series_number(message: Message, state: FSMContext) 
 
     def validate_seriya(val: str) -> tuple[bool, str]:
         s = val.replace(" ", "").upper()
-        # Nümunələr: AA1234567 (2 hərf + 7-8 rəqəm), AZE1234567 (passport)
+        # Nümunələr: AA1234567 (2 hərf + 7 rəqəm), AZE12345678 (passport)
         patterns = [
-            r"^[A-Z]{2}\d{7,8}$",
-            r"^[A-Z]{3}\d{7}$",
+            r"^[A-Z]{2}\d{7}$",
+            r"^[A-Z]{3}\d{8}$",
         ]
         for p in patterns:
             if re.match(p, s):
                 return True, s
         return False, (
-            "Vəsiqə seriyası/nömrəsi düzgün deyil. Nümunələr: AA1234567 və ya AZE1234567. "
+            "Vəsiqə seriyası/nömrəsi düzgün deyil. Nümunələr: AA1234567 və ya AZE12345678. "
             "Yalnız latın hərfləri və rəqəmlər, boşluq olmadan."
         )
 
@@ -873,7 +872,7 @@ async def reg_enter_document_series_number(message: Message, state: FSMContext) 
 
     await state.update_data(document_series_number=normalized)
     await state.set_state(Reg.phone_number)
-    await message.answer("Telefon nömrənizi daxil edin (məs: +994501234567):")
+    await message.answer("Telefon nömrənizi daxil edin (məs: 501234567 və ya 0501234567):")
 
 
 def validate_and_normalize_phone(phone: str) -> tuple[bool, str]:
@@ -889,6 +888,12 @@ def validate_and_normalize_phone(phone: str) -> tuple[bool, str]:
     
     # Yalnız rəqəmlər və + simvolu
     clean_phone = phone.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+
+    # 9 rəqəmli yerli format (məs: 501234567) -> +994501234567
+    if len(clean_phone) == 9 and clean_phone.isdigit():
+        if clean_phone.startswith(("50", "51", "55", "60", "70", "77", "10", "12", "90", "99")):
+            return (True, f"+994{clean_phone}")
+        return (False, "Telefon nömrəsi düzgün deyil. Nümunə: 501234567 və ya 0501234567")
     
     # +994 formatında
     if clean_phone.startswith("+994"):
@@ -897,7 +902,7 @@ def validate_and_normalize_phone(phone: str) -> tuple[bool, str]:
             # Operator kodu ilə başlamalıdır (50, 51, 55, 60, 70, 77, 10, 12, 90, 99)
             if digits.startswith(("50", "51", "55", "60", "70", "77", "10", "12", "90", "99")):
                 return (True, f"+994{digits}")
-        return (False, "Telefon nömrəsi düzgün deyil. Format: +994XXXXXXXXX (məs: +994501234567)")
+        return (False, "Telefon nömrəsi düzgün deyil. Nümunə: 501234567 və ya 0501234567")
     
     # 994 formatında (+ olmadan)
     if clean_phone.startswith("994"):
@@ -905,7 +910,7 @@ def validate_and_normalize_phone(phone: str) -> tuple[bool, str]:
         if len(digits) == 9 and digits.isdigit():
             if digits.startswith(("50", "51", "55", "60", "70", "77", "10", "12", "90", "99")):
                 return (True, f"+994{digits}")
-        return (False, "Telefon nömrəsi düzgün deyil. Format: +994XXXXXXXXX və ya 994XXXXXXXXX")
+        return (False, "Telefon nömrəsi düzgün deyil. Nümunə: 501234567 və ya 0501234567")
     
     # 0 ilə başlayır (yerli format: 050, 051, və s.)
     if clean_phone.startswith("0"):
@@ -914,9 +919,9 @@ def validate_and_normalize_phone(phone: str) -> tuple[bool, str]:
             if operator in ("50", "51", "55", "60", "70", "77", "10", "12"):
                 # 0-ı çıxarıb +994 əlavə et
                 return (True, f"+994{clean_phone[1:]}")
-        return (False, "Telefon nömrəsi düzgün deyil. Format: +994XXXXXXXXX və ya 0XXXXXXXXX")
+        return (False, "Telefon nömrəsi düzgün deyil. Nümunə: 501234567 və ya 0501234567")
     
-    return (False, "Telefon nömrəsi düzgün formatda deyil. Məs: +994501234567 və ya 0501234567")
+    return (False, "Telefon nömrəsi düzgün formatda deyil. Nümunə: 501234567 və ya 0501234567")
 
 
 @dp.message(Reg.phone_number)
@@ -1009,94 +1014,22 @@ async def cmd_bugun(message: Message) -> None:
         await message.answer("❌ Bu əmr yalnız admin üçündür.")
         return
 
-    db.init_db()
-    db.init_gps_tables()
-
+    db.init_registrations()
     today = today_baku()
+    rows = db.get_registrations_summary(today)
+    if not rows:
+        await message.answer("Bu gün üçün qeydiyyat yoxdur.")
+        return
 
-    # Legacy attendance (users table) summary
-    att = db.get_todays_attendance(today)
-    leg_lines = ["📋 Bu günün davamiyyəti (Legacy):\n"]
-    if att:
-        checked_out = [w for w in att if w.get('giris_time') and w.get('cixis_time')]
-        checked_in = [w for w in att if w.get('giris_time') and not w.get('cixis_time')]
-        if checked_out:
-            leg_lines.append(f"✅ İşini bitirdi: {len(checked_out)}")
-            for w in checked_out:
-                leg_lines.append(f"• {w['name']} ({w['code']}) - {w['giris_time']} → {w['cixis_time']}")
-            leg_lines.append("")
-        if checked_in:
-            leg_lines.append(f"🔵 İşdədir: {len(checked_in)}")
-            for w in checked_in:
-                leg_lines.append(f"• {w['name']} ({w['code']}) - {w['giris_time']}")
-            leg_lines.append("")
-        if not checked_in and not checked_out:
-            leg_lines.append("Heç bir qeyd yoxdur.")
-    else:
-        leg_lines.append("Heç bir qeyd yoxdur.")
+    lines: list[str] = [f"📊 Bu gün ({today})"]
+    for r in rows:
+        prof = r.get("profession") or "-"
+        code = r.get("code") or "-"
+        cnt = r.get("cnt") or 0
+        lines.append(f"{prof} | Qrup: {code} | Say: {cnt}")
 
-    # GPS sessions
-    rows = db.get_today_sessions(today)
-    gps_lines = ["📡 Bu günün GPS sessiyaları:\n"]
-    if rows:
-        for r in rows:
-            start_t = r.get("start_time", "-")
-            end_t = r.get("end_time") or "-"
-            dur = r.get("duration_min")
-            dur_s = f"{dur} dəq" if isinstance(dur, int) else "-"
-
-            # Use registered name if available, otherwise fallback to full_name
-            display_name = r.get('display_name') or r.get('full_name', '?')
-            
-            # Check if GPS coordinates exist
-            start_lat = r.get('start_lat')
-            start_lon = r.get('start_lon')
-            
-            block = [
-                f"• {display_name}",
-                f"  Giriş: {start_t}",
-            ]
-            
-            if start_lat is not None and start_lon is not None:
-                try:
-                    s_lat = float(start_lat)
-                    s_lon = float(start_lon)
-                    s_addr = await reverse_geocode(s_lat, s_lon)
-                    s_link = f"https://maps.google.com/?q={s_lat},{s_lon}"
-                    # Ünvan tapılmazsa mətni göstərmə, yalnız linki göstər
-                    if s_addr and s_addr.strip() and s_addr.strip().lower() != "lokasiya tapılmadı":
-                        block.append(f"     📍 {s_addr}")
-                    block.append(f"     🔗 {s_link}")
-                except (ValueError, TypeError):
-                    block.append("     📍 GPS koordinatları düzgün deyil")
-            else:
-                block.append("     📍 GPS koordinatları yoxdur")
-            
-            block.append(f"  Çıxış: {end_t}")
-            
-            end_lat = r.get('end_lat')
-            end_lon = r.get('end_lon')
-            if end_lat is not None and end_lon is not None:
-                try:
-                    e_lat = float(end_lat)
-                    e_lon = float(end_lon)
-                    e_addr = await reverse_geocode(e_lat, e_lon)
-                    e_link = f"https://maps.google.com/?q={e_lat},{e_lon}"
-                    if e_addr and e_addr.strip() and e_addr.strip().lower() != "lokasiya tapılmadı":
-                        block.append(f"     📍 {e_addr}")
-                    block.append(f"     🔗 {e_link}")
-                except (ValueError, TypeError):
-                    block.append("     📍 GPS koordinatları düzgün deyil")
-            else:
-                block.append("     📍 GPS koordinatları yoxdur")
-            
-            block.append(f"  ⏱ {dur_s}")
-            gps_lines.append("\n".join(block))
-    else:
-        gps_lines.append("GPS sessiya tapılmadı.")
-
-    text = "\n".join(leg_lines + [""] + gps_lines)
-    for part in chunk_send(text):
+    txt = "\n".join(lines)
+    for part in chunk_send(txt):
         await message.answer(part)
 
 
@@ -1242,16 +1175,6 @@ async def adminadd_enter_code(message: Message, state: FSMContext) -> None:
     else:
         today = date
     db.init_group_codes()
-
-    if profession:
-        existing = db.get_code_for(profession=profession, date=today)
-        if existing is not None:
-            await state.clear()
-            await message.answer(
-                f"ℹ️ Bu peşə üçün {today} tarixində qrup kodu artıq var: {existing}",
-                reply_markup=admin_keyboard(),
-            )
-            return
 
     ok = False
     for attempt in range(3):
@@ -2222,11 +2145,6 @@ async def cmd_addgcode(message: Message) -> None:
         await message.answer("Peşə tapılmadı. /professions ilə siyahıya baxın.")
         return
 
-    existing = db.get_code_for(profession=prof, date=date)
-    if existing is not None:
-        await message.answer(f"ℹ️ Bu peşə üçün {date} tarixində qrup kodu artıq var: {existing}")
-        return
-
     ok = db.add_group_code(profession=prof, date=date, code=code, is_active=is_active)
     await message.answer("✅ Yadda saxlandı" if ok else "❌ Xəta")
 
@@ -2389,32 +2307,51 @@ async def admin_manage_group_date(message: Message, state: FSMContext) -> None:
         await state.set_state(AdminAddG.code)
         await message.answer("Qrup kodunu daxil edin:", reply_markup=ReplyKeyboardRemove())
     elif action == "delete_code":
-        await state.clear()
-        if not profession:
-            await message.answer("❌ Xəta.", reply_markup=admin_keyboard())
-            return
-        try:
-            db.init_group_codes()
-            ok = False
-            for attempt in range(3):
-                try:
-                    ok = db.delete_group_code(profession=profession, date=date)
-                    break
-                except sqlite3.OperationalError as e:
-                    if "locked" in str(e).lower():
-                        await asyncio.sleep(0.5 * (attempt + 1))
-                        continue
-                    raise
-            if ok:
-                await message.answer("✅ Qrup kodu silindi.", reply_markup=admin_keyboard())
-            else:
-                await message.answer("ℹ️ Bu tarix və peşə üçün qrup kodu tapılmadı.", reply_markup=admin_keyboard())
-        except Exception as e:
-            print(f"[admin_manage_group_date] delete_code error: {e}")
-            await message.answer("❌ Xəta baş verdi.", reply_markup=admin_keyboard())
+        await state.set_state(AdminManageGroup.code)
+        await message.answer("Silinəcək qrup kodunu daxil edin:", reply_markup=ReplyKeyboardRemove())
     else:
         await state.clear()
         await message.answer("❌ Xəta.", reply_markup=admin_keyboard())
+
+
+@dp.message(AdminManageGroup.code)
+async def admin_manage_group_code(message: Message, state: FSMContext) -> None:
+    code = (message.text or "").strip()
+    if not code:
+        await message.answer("❌ Kod boş ola bilməz.")
+        return
+
+    data = await state.get_data()
+    action = data.get("action")
+    profession = data.get("profession")
+    date = data.get("date")
+
+    if action != "delete_code" or not profession or not date:
+        await state.clear()
+        await message.answer("❌ Xəta.", reply_markup=admin_keyboard())
+        return
+
+    try:
+        db.init_group_codes()
+        ok = False
+        for attempt in range(3):
+            try:
+                ok = db.delete_group_code(profession=profession, date=date, code=code)
+                break
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower():
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+        await state.clear()
+        if ok:
+            await message.answer("✅ Qrup kodu silindi.", reply_markup=admin_keyboard())
+        else:
+            await message.answer("ℹ️ Bu tarix, peşə və kod üçün məlumat tapılmadı.", reply_markup=admin_keyboard())
+    except Exception as e:
+        await state.clear()
+        print(f"[admin_manage_group_code] delete_code error: {e}")
+        await message.answer("❌ Xəta baş verdi.", reply_markup=admin_keyboard())
 
 
 @dp.message(AdminManageStudent.action)
@@ -2900,7 +2837,7 @@ async def handle_cixis(message: Message) -> None:
             pending_action.pop(user_id, None)
             return
         else:
-            # Early safeguard: do not even prompt for location if 3 hours not passed
+            # Early safeguard: do not even prompt for location if minimum work duration not passed
             try:
                 start_time = parse_dt_to_baku(sess["start_time"])  # type: ignore[index]
                 now = now_baku()
@@ -2951,7 +2888,7 @@ async def cmd_help(message: Message) -> None:
         "• GPS aktiv olmalıdır\n"
         "• Giriş 11:00-a qədər olmalıdır\n"
         "• Çıxış 19:00-a qədər olmalıdır\n"
-        "• Minimum iş müddəti 3 saatdır\n\n"
+        "• Minimum iş müddəti 6 saatdır\n\n"
         "Suallarınız üçün admin ilə əlaqə saxlayın."
     )
     
