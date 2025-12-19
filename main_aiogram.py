@@ -105,7 +105,7 @@ TG_CHUNK_LIMIT = 3500
 # Məkən koordinatları (lat, lon) və radius (metrlə)
 WORKPLACE_LAT = float(os.getenv("WORKPLACE_LAT", "40.4093"))  # Baku koordinatları default
 WORKPLACE_LON = float(os.getenv("WORKPLACE_LON", "49.8671"))
-WORKPLACE_RADIUS_M = float(os.getenv("WORKPLACE_RADIUS_M", "100"))  # 100 metr default radius
+WORKPLACE_RADIUS_M = min(float(os.getenv("WORKPLACE_RADIUS_M", "300")), 300.0)
 
 # Giriş-çıxış vaxt məhdudiyyətləri
 CHECKIN_DEADLINE_HOUR = 11  # Giriş 11:00-a qədər
@@ -129,8 +129,11 @@ def today_baku() -> str:
     return now_baku().date().isoformat()
 
 
-def parse_dt_to_baku(value: str) -> datetime:
-    dt = datetime.fromisoformat(value)
+def parse_dt_to_baku(value) -> datetime:
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = datetime.fromisoformat(str(value))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(BAKU_TZ)
@@ -1021,12 +1024,12 @@ async def cmd_bugun(message: Message) -> None:
         await message.answer("Bu gün üçün qeydiyyat yoxdur.")
         return
 
-    lines: list[str] = [f"📊 Bu gün ({today})"]
+    lines: list[str] = []
     for r in rows:
         prof = r.get("profession") or "-"
         code = r.get("code") or "-"
         cnt = r.get("cnt") or 0
-        lines.append(f"{prof} | Qrup: {code} | Say: {cnt}")
+        lines.append(f"{prof} | {code} | {cnt}")
 
     txt = "\n".join(lines)
     for part in chunk_send(txt):
@@ -1043,7 +1046,7 @@ async def btn_isciler(message: Message) -> None:
     workers = db.get_all_workers_status()
     today = today_baku()
     db.init_group_codes()
-    active_rows = db.get_group_codes(date=today, only_active=True)
+    active_rows = db.get_group_codes(active_on=today, only_active=True)
     active_codes = {r.get('code') for r in active_rows}
     if active_codes:
         workers = [w for w in workers if (w.get('code') in active_codes)]
@@ -2239,11 +2242,11 @@ async def admin_manage_group_action(message: Message, state: FSMContext) -> None
         await state.clear()
         today = today_baku()
         db.init_group_codes()
-        rows = db.get_group_codes(date=today, only_active=None)
+        rows = db.get_group_codes(active_on=today, only_active=None)
         if not rows:
-            await message.answer("Bu gün üçün kod yoxdur.", reply_markup=admin_keyboard())
+            await message.answer("Aktiv kod yoxdur.", reply_markup=admin_keyboard())
             return
-        lines = ["Bu günün kodları:"]
+        lines = ["Aktiv kodlar:"]
         for r in rows:
             lines.append(f"• {r.get('profession')} → {r.get('code')}")
         await message.answer("\n".join(lines), reply_markup=admin_keyboard())
@@ -2779,6 +2782,16 @@ async def handle_giris(message: Message) -> None:
         return
     user_id = user.id
 
+    now = now_baku()
+    if now.hour >= CHECKIN_DEADLINE_HOUR:
+        await message.answer(
+            f"❌ Giriş {CHECKIN_DEADLINE_HOUR}:00-dan sonra vurula bilməz. "
+            f"Hal-hazırda vaxt: {now.strftime('%H:%M')}",
+            reply_markup=worker_keyboard(),
+        )
+        pending_action.pop(user_id, None)
+        return
+
     # Check if user is active
     prof = db.get_user_by_telegram_id(user_id)
     if prof and prof.get("is_active", 1) == 0:
@@ -2831,7 +2844,7 @@ async def handle_cixis(message: Message) -> None:
         sess = db.get_open_session(uid)
         if not sess:
             await message.answer(
-                "ℹ️ Açıq sessiya tapılmadı. Ola bilsin bu gün artıq çıxış etmisiniz və ya giriş etməmisiniz.",
+                "❌ Giriş etmədiyiniz üçün çıxış edə bilmirsiniz. Əvvəlcə giriş edin.",
                 reply_markup=worker_keyboard(),
             )
             pending_action.pop(user_id, None)
@@ -3100,7 +3113,7 @@ async def handle_location(message: Message) -> None:
             sess = db.get_open_session(uid)
             if not sess:
                 await message.answer(
-                    "❌ Giriş vurulmadan çıxış vurmaq mümkün deyil. Əvvəlcə giriş edin.",
+                    "❌ Giriş etmədiyiniz üçün çıxış edə bilmirsiniz. Əvvəlcə giriş edin.",
                     reply_markup=worker_keyboard(),
                 )
                 pending_action.pop(user_id, None)
@@ -3170,29 +3183,7 @@ async def handle_location(message: Message) -> None:
                     )
                 return
             
-            # Qayda 5: Eyni yerdədir? (tolerance ilə)
-            if dist_m > LOCATION_TOLERANCE_M:
-                await message.answer(
-                    f"❌ Tələbə giriş vurduğu yerdən başqa yerdə çıxış vura bilməz.\n\n"
-                    f"📍 Giriş lokasiyasından məsafə: {int(dist_m)} metr\n"
-                    f"📍 Maksimum icazə verilən məsafə: {LOCATION_TOLERANCE_M} metr\n\n"
-                    f"Zəhmət olmasa giriş etdiyiniz yerdə çıxış edin.",
-                    reply_markup=worker_keyboard()
-                )
-                pending_action.pop(user_id, None)
-                
-                # Çağrı mərkəzinə bildiriş
-                if ADMIN_ID != 0:
-                    await notifications.notify_rule_violation(
-                        bot=bot,
-                        admin_id=ADMIN_ID,
-                        user_id=user_id,
-                        user_name=name,
-                        user_phone=user_phone,
-                        violation_type="Yanlış çıxış - fərqli lokasiya",
-                        details=f"Çıxış girişdən fərqli yerdə vurulub. Məsafə: {int(dist_m)} metr (Maksimum: {LOCATION_TOLERANCE_M} metr). Giriş: ({start_lat}, {start_lon}), Çıxış: ({lat}, {lon})"
-                    )
-                return
+            # Qayda 5 (praktika): Giriş-çıxış eyni nöqtə məhdudiyyəti tətbiq edilmir.
             
             # Qayda 6: Məkəndədir?
             dist_from_workplace = haversine_m(WORKPLACE_LAT, WORKPLACE_LON, lat, lon)
