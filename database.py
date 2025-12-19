@@ -184,6 +184,8 @@ if _USING_POSTGRES:
 DB_FILE = 'attendance.db'
 _db_lock = Lock()
 
+GROUP_CODE_NO_EXPIRY_DATE = os.getenv('GROUP_CODE_NO_EXPIRY_DATE', '9999-12-31')
+
 
 def init_db():
     """Initialize database with required tables"""
@@ -875,6 +877,7 @@ def init_group_codes() -> None:
                     profession TEXT NOT NULL,
                     date {date_type} NOT NULL,
                     code TEXT NOT NULL,
+                    expires_at {date_type} NOT NULL,
                     is_active {active_type} NOT NULL DEFAULT {active_default},
                     UNIQUE(profession, date, code)
                 )
@@ -886,6 +889,29 @@ def init_group_codes() -> None:
                     active_default='TRUE' if _USING_POSTGRES else '1',
                 )
             )
+            try:
+                if not _USING_POSTGRES:
+                    cursor.execute("PRAGMA table_info(group_codes)")
+                    cols = [c[1] for c in (cursor.fetchall() or [])]
+                    if 'expires_at' not in cols:
+                        cursor.execute('ALTER TABLE group_codes ADD COLUMN expires_at TEXT')
+            except Exception:
+                pass
+            try:
+                if _USING_POSTGRES:
+                    cursor.execute('ALTER TABLE group_codes ADD COLUMN expires_at DATE')
+            except Exception:
+                pass
+            try:
+                if _USING_POSTGRES:
+                    cursor.execute('UPDATE group_codes SET expires_at = %s::date WHERE expires_at IS NULL', (GROUP_CODE_NO_EXPIRY_DATE,))
+                else:
+                    cursor.execute(
+                        'UPDATE group_codes SET expires_at = ? WHERE expires_at IS NULL OR expires_at = ""',
+                        (GROUP_CODE_NO_EXPIRY_DATE,)
+                    )
+            except Exception:
+                pass
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_codes_date ON group_codes(date)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_codes_prof ON group_codes(profession)')
             conn.commit()
@@ -893,8 +919,10 @@ def init_group_codes() -> None:
             conn.close()
 
 
-def add_group_code(profession: str, date: str, code: str, is_active: int = 1) -> bool:
+def add_group_code(profession: str, date: str, code: str, is_active: int = 1, expires_at: Optional[str] = None) -> bool:
     """Insert (or update) code for a profession+date. Allows multiple codes per day."""
+    if expires_at is None:
+        expires_at = GROUP_CODE_NO_EXPIRY_DATE
     with _db_lock:
         try:
             conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -903,8 +931,8 @@ def add_group_code(profession: str, date: str, code: str, is_active: int = 1) ->
                 cursor.execute('PRAGMA busy_timeout=5000')
                 # Try insert; if exists, update active flag for the same (profession,date,code)
                 cursor.execute(
-                    'INSERT INTO group_codes (profession, date, code, is_active) VALUES (?, ?, ?, ?)',
-                    (profession, date, code, (bool(is_active) if _USING_POSTGRES else (1 if is_active else 0)))
+                    'INSERT INTO group_codes (profession, date, code, expires_at, is_active) VALUES (?, ?, ?, ?, ?)',
+                    (profession, date, code, expires_at, (bool(is_active) if _USING_POSTGRES else (1 if is_active else 0)))
                 )
                 conn.commit()
                 return True
@@ -917,8 +945,8 @@ def add_group_code(profession: str, date: str, code: str, is_active: int = 1) ->
                 cursor = conn.cursor()
                 cursor.execute('PRAGMA busy_timeout=5000')
                 cursor.execute(
-                    'UPDATE group_codes SET is_active = ? WHERE profession = ? AND date = ? AND code = ?',
-                    ((bool(is_active) if _USING_POSTGRES else (1 if is_active else 0)), profession, date, code)
+                    'UPDATE group_codes SET is_active = ?, expires_at = ? WHERE profession = ? AND date = ? AND code = ?',
+                    ((bool(is_active) if _USING_POSTGRES else (1 if is_active else 0)), expires_at, profession, date, code)
                 )
                 conn.commit()
                 return True
@@ -962,7 +990,7 @@ def delete_group_code(profession: str, date: str, code: str) -> bool:
             conn.close()
 
 
-def get_group_codes(date: Optional[str] = None, only_active: Optional[bool] = None) -> List[dict]:
+def get_group_codes(date: Optional[str] = None, only_active: Optional[bool] = None, active_on: Optional[str] = None) -> List[dict]:
     """List group codes optionally filtered by date and active flag."""
     with _db_lock:
         conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -970,12 +998,17 @@ def get_group_codes(date: Optional[str] = None, only_active: Optional[bool] = No
         try:
             cursor = conn.cursor()
             cursor.execute('PRAGMA busy_timeout=5000')
-            query = 'SELECT profession, date, code, is_active FROM group_codes'
+            query = 'SELECT profession, date, code, expires_at, is_active FROM group_codes'
             params: list = []
             conds: list[str] = []
             if date:
                 conds.append('date = ?')
                 params.append(date)
+            if active_on:
+                conds.append('date <= ?')
+                params.append(active_on)
+                conds.append('(expires_at >= ? OR expires_at IS NULL OR expires_at = "")')
+                params.append(active_on)
             if only_active is True:
                 conds.append('is_active = {active}'.format(active='TRUE' if _USING_POSTGRES else '1'))
             elif only_active is False:
@@ -1004,6 +1037,9 @@ def get_codes_for(profession: str, date: Optional[str] = None, only_active: bool
                 params.append(date)
             if only_active:
                 query += ' AND is_active = {active}'.format(active='TRUE' if _USING_POSTGRES else '1')
+                today_iso = datetime.now().date().isoformat()
+                query += ' AND date <= ? AND (expires_at >= ? OR expires_at IS NULL OR expires_at = "")'
+                params.extend([today_iso, today_iso])
             query += ' ORDER BY date DESC, code'
             cursor.execute(query, tuple(params))
             return [r[0] for r in (cursor.fetchall() or [])]
@@ -1017,18 +1053,20 @@ def get_code_for(profession: str, date: str) -> Optional[str]:
     return codes[0] if codes else None
 
 
-def is_group_code_valid(profession: str, code: str) -> bool:
+def is_group_code_valid(profession: str, code: str, on_date: Optional[str] = None) -> bool:
     """Check if a code exists for the profession and is active (date-independent)."""
+    if on_date is None:
+        on_date = datetime.now().date().isoformat()
     with _db_lock:
         conn = sqlite3.connect(DB_FILE, timeout=10)
         try:
             cursor = conn.cursor()
             cursor.execute('PRAGMA busy_timeout=5000')
             cursor.execute(
-                'SELECT 1 FROM group_codes WHERE profession = ? AND code = ? AND is_active = {active} LIMIT 1'.format(
+                'SELECT 1 FROM group_codes WHERE profession = ? AND code = ? AND date <= ? AND (expires_at >= ? OR expires_at IS NULL OR expires_at = "") AND is_active = {active} LIMIT 1'.format(
                     active='TRUE' if _USING_POSTGRES else '1'
                 ),
-                (profession, code)
+                (profession, code, on_date, on_date)
             )
             return cursor.fetchone() is not None
         finally:
