@@ -896,11 +896,21 @@ def init_group_codes() -> None:
                     if 'expires_at' not in cols:
                         cursor.execute('ALTER TABLE group_codes ADD COLUMN expires_at TEXT')
             except Exception:
+                if _USING_POSTGRES:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                 pass
             try:
                 if _USING_POSTGRES:
                     cursor.execute('ALTER TABLE group_codes ADD COLUMN expires_at DATE')
             except Exception:
+                if _USING_POSTGRES:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                 pass
             try:
                 if _USING_POSTGRES:
@@ -911,6 +921,11 @@ def init_group_codes() -> None:
                         (GROUP_CODE_NO_EXPIRY_DATE,)
                     )
             except Exception:
+                if _USING_POSTGRES:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                 pass
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_codes_date ON group_codes(date)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_codes_prof ON group_codes(profession)')
