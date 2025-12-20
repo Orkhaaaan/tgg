@@ -21,30 +21,39 @@ _pg_pool: Optional["pool.SimpleConnectionPool"] = None
 _pool_lock = Lock()
 
 
-def initialize_pool():
+def initialize_pool() -> None:
     """Initialize PostgreSQL connection pool. Call once at startup."""
     global _pg_pool
-    if not _USING_POSTGRES:
-        return  # No pool needed for SQLite
-    
     with _pool_lock:
-        if _pg_pool is None:
+        if _pg_pool is not None:
+            return
+
+        last_err: Optional[Exception] = None
+        for attempt in range(30):
             try:
-                _pg_pool = pool.SimpleConnectionPool(
-                    minconn=5,
-                    maxconn=100,  # Increased for high load (1000+ users)
-                    dsn=_DATABASE_URL,
-                    sslmode='require'
-                )
-                print(f"✓ PostgreSQL connection pool initialized (5-100 connections)")
-            except TypeError:
-                # Fallback if sslmode not supported
-                _pg_pool = pool.SimpleConnectionPool(
-                    minconn=5,
-                    maxconn=100,  # Increased for high load (1000+ users)
-                    dsn=_DATABASE_URL
-                )
-                print(f"✓ PostgreSQL connection pool initialized (5-100 connections, no SSL)")
+                try:
+                    _pg_pool = pool.SimpleConnectionPool(
+                        minconn=5,
+                        maxconn=100,
+                        dsn=_DATABASE_URL,
+                        sslmode=os.getenv('PGSSLMODE', 'require'),
+                    )
+                except TypeError:
+                    _pg_pool = pool.SimpleConnectionPool(
+                        minconn=5,
+                        maxconn=100,
+                        dsn=_DATABASE_URL,
+                    )
+                print('✓ PostgreSQL connection pool initialized (5-100 connections)')
+                return
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+                if 'starting up' in msg or 'could not connect' in msg or 'connection refused' in msg:
+                    time.sleep(min(10.0, 1.0 + attempt * 0.7))
+                    continue
+                raise
+        raise last_err if last_err else RuntimeError('Failed to initialize PostgreSQL pool')
 
 
 def close_pool():
@@ -870,6 +879,15 @@ def init_group_codes() -> None:
                 except Exception:
                     # If migration fails for any reason, continue and rely on new installs.
                     pass
+            if _USING_POSTGRES:
+                try:
+                    cursor.execute('ALTER TABLE group_codes DROP CONSTRAINT IF EXISTS group_codes_profession_date_key')
+                except Exception:
+                    try:
+                        conn.rollback()
+                        cursor = conn.cursor()
+                    except Exception:
+                        pass
             cursor.execute(
                 '''
                 CREATE TABLE IF NOT EXISTS group_codes (
@@ -889,44 +907,23 @@ def init_group_codes() -> None:
                     active_default='TRUE' if _USING_POSTGRES else '1',
                 )
             )
-            try:
-                if not _USING_POSTGRES:
-                    cursor.execute("PRAGMA table_info(group_codes)")
-                    cols = [c[1] for c in (cursor.fetchall() or [])]
-                    if 'expires_at' not in cols:
-                        cursor.execute('ALTER TABLE group_codes ADD COLUMN expires_at TEXT')
-            except Exception:
-                if _USING_POSTGRES:
+            if _USING_POSTGRES:
+                try:
+                    cursor.execute('ALTER TABLE group_codes ADD COLUMN IF NOT EXISTS expires_at DATE')
+                except Exception:
                     try:
                         conn.rollback()
+                        cursor = conn.cursor()
                     except Exception:
                         pass
-                pass
-            try:
-                if _USING_POSTGRES:
-                    cursor.execute('ALTER TABLE group_codes ADD COLUMN expires_at DATE')
-            except Exception:
-                if _USING_POSTGRES:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                pass
-            try:
-                if _USING_POSTGRES:
+                try:
                     cursor.execute('UPDATE group_codes SET expires_at = %s::date WHERE expires_at IS NULL', (GROUP_CODE_NO_EXPIRY_DATE,))
-                else:
-                    cursor.execute(
-                        'UPDATE group_codes SET expires_at = ? WHERE expires_at IS NULL OR expires_at = ""',
-                        (GROUP_CODE_NO_EXPIRY_DATE,)
-                    )
-            except Exception:
-                if _USING_POSTGRES:
+                except Exception:
                     try:
                         conn.rollback()
+                        cursor = conn.cursor()
                     except Exception:
                         pass
-                pass
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_codes_date ON group_codes(date)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_codes_prof ON group_codes(profession)')
             conn.commit()
