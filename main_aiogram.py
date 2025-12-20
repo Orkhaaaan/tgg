@@ -766,65 +766,75 @@ async def handle_start(message: Message, state: FSMContext) -> None:
 
 @dp.message(Reg.profession)
 async def reg_pick_profession(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    if text == "❌ Ləğv et":
+    try:
+        text = (message.text or "").strip()
+        if text == "❌ Ləğv et":
+            await state.clear()
+            await message.answer("Ləğv edildi.", reply_markup=worker_keyboard())
+            return
+
+        chosen = None
+        raw = text.strip('"\' ').strip()
+
+        # 1) numeric prefix like "1." or just number
+        idx_part = raw.split(".", 1)[0]
+        if idx_part.isdigit():
+            idx = int(idx_part) - 1
+            if 0 <= idx < len(PROFESSIONS):
+                chosen = PROFESSIONS[idx]
+
+        # 2) exact case-insensitive
+        if not chosen:
+            for p in PROFESSIONS:
+                if p.lower() == raw.lower():
+                    chosen = p
+                    break
+
+        # 3) loose contains match
+        if not chosen:
+            for p in PROFESSIONS:
+                if raw.lower() in p.lower():
+                    chosen = p
+                    break
+
+        if not chosen:
+            await message.answer("Peşə düzgün seçilmədi, siyahıdan seçin.", reply_markup=professions_keyboard())
+            return
+
+        await state.update_data(profession=chosen)
+        await state.set_state(Reg.code)
+        today = today_baku()
+        await message.answer(
+            f"Peşə: {chosen}\nİndi isə bu günün kodunu daxil edin ({today})",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except Exception as e:
+        print(f"[reg_pick_profession] error: {e}")
         await state.clear()
-        await message.answer("Ləğv edildi.", reply_markup=worker_keyboard())
-        return
-
-    chosen = None
-    raw = text.strip('"\' ').strip()
-
-    # 1) numeric prefix like "1." or just number
-    idx_part = raw.split(".", 1)[0]
-    if idx_part.isdigit():
-        idx = int(idx_part) - 1
-        if 0 <= idx < len(PROFESSIONS):
-            chosen = PROFESSIONS[idx]
-
-    # 2) exact case-insensitive
-    if not chosen:
-        for p in PROFESSIONS:
-            if p.lower() == raw.lower():
-                chosen = p
-                break
-
-    # 3) loose contains match
-    if not chosen:
-        for p in PROFESSIONS:
-            if raw.lower() in p.lower():
-                chosen = p
-                break
-
-    if not chosen:
-        await message.answer("Peşə düzgün seçilmədi, siyahıdan seçin.", reply_markup=professions_keyboard())
-        return
-
-    await state.update_data(profession=chosen)
-    await state.set_state(Reg.code)
-    today = today_baku()
-    await message.answer(
-        f"Peşə: {chosen}\nİndi isə bu günün kodunu daxil edin ({today})",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+        await message.answer("❌ Xəta baş verdi. Qeydiyyatı yenidən başlayın: /start")
 
 
 @dp.message(Reg.code)
 async def reg_enter_code(message: Message, state: FSMContext) -> None:
-    code = (message.text or "").strip()
-    data = await state.get_data()
-    prof = data.get("profession")
-    if not prof:
-        await state.set_state(Reg.profession)
-        await message.answer("Əvvəl peşə seçin.", reply_markup=professions_keyboard())
-        return
-    db.init_group_codes()
-    if not db.is_group_code_valid(profession=prof, code=code):
-        await message.answer("❌ Kod yanlışdır. Yenidən cəhd edin.")
-        return
-    await state.update_data(code=code)
-    await state.set_state(Reg.name)
-    await message.answer("Ad Soyad daxil edin:")
+    try:
+        code = (message.text or "").strip()
+        data = await state.get_data()
+        prof = data.get("profession")
+        if not prof:
+            await state.set_state(Reg.profession)
+            await message.answer("Əvvəl peşə seçin.", reply_markup=professions_keyboard())
+            return
+        db.init_group_codes()
+        if not db.is_group_code_valid(profession=prof, code=code):
+            await message.answer("❌ Kod yanlışdır. Yenidən cəhd edin.")
+            return
+        await state.update_data(code=code)
+        await state.set_state(Reg.name)
+        await message.answer("Ad Soyad daxil edin:")
+    except Exception as e:
+        print(f"[reg_enter_code] error: {e}")
+        await state.clear()
+        await message.answer("❌ Xəta baş verdi. Qeydiyyatı yenidən başlayın: /start")
 
 
 @dp.message(Reg.name)
