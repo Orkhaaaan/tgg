@@ -2828,6 +2828,16 @@ async def handle_cixis(message: Message) -> None:
         return
     user_id = user.id
 
+    now = now_baku()
+    if now.hour >= CHECKOUT_DEADLINE_HOUR:
+        await message.answer(
+            f"❌ Çıxış {CHECKOUT_DEADLINE_HOUR}:00-dan sonra vurula bilməz. "
+            f"Hal-hazırda vaxt: {now.strftime('%H:%M')}",
+            reply_markup=worker_keyboard(),
+        )
+        pending_action.pop(user_id, None)
+        return
+
     # Check if user is active
     prof = db.get_user_by_telegram_id(user_id)
     if prof and prof.get("is_active", 1) == 0:
@@ -2948,6 +2958,52 @@ async def handle_location(message: Message) -> None:
         now = now_baku()
         now_iso = now.isoformat(timespec="seconds")
         today = now.date().isoformat()
+
+        if action == "checkin" and now.hour >= CHECKIN_DEADLINE_HOUR:
+            prof = db.get_user_by_telegram_id(user_id)
+            name = (prof.get("name") if prof else user.full_name) or "Istifadəçi"
+            user_phone = prof.get("phone_number") if prof else None
+
+            await message.answer(
+                f"❌ Giriş {CHECKIN_DEADLINE_HOUR}:00-dan sonra vurula bilməz. "
+                f"Hal-hazırda vaxt: {now.strftime('%H:%M')}",
+                reply_markup=worker_keyboard(),
+            )
+            pending_action.pop(user_id, None)
+            if ADMIN_ID != 0:
+                await notifications.notify_rule_violation(
+                    bot=bot,
+                    admin_id=ADMIN_ID,
+                    user_id=user_id,
+                    user_name=name,
+                    user_phone=user_phone,
+                    violation_type="Gecikmə - giriş vaxtı keçib",
+                    details=f"Giriş {CHECKIN_DEADLINE_HOUR}:00-dan sonra vurulmağa cəhd edildi. Cari vaxt: {now.strftime('%H:%M')}" ,
+                )
+            return
+
+        if action == "checkout" and now.hour >= CHECKOUT_DEADLINE_HOUR:
+            prof = db.get_user_by_telegram_id(user_id)
+            name = (prof.get("name") if prof else user.full_name) or "Istifadəçi"
+            user_phone = prof.get("phone_number") if prof else None
+
+            await message.answer(
+                f"❌ Çıxış {CHECKOUT_DEADLINE_HOUR}:00-dan sonra vurula bilməz. "
+                f"Hal-hazırda vaxt: {now.strftime('%H:%M')}",
+                reply_markup=worker_keyboard(),
+            )
+            pending_action.pop(user_id, None)
+            if ADMIN_ID != 0:
+                await notifications.notify_rule_violation(
+                    bot=bot,
+                    admin_id=ADMIN_ID,
+                    user_id=user_id,
+                    user_name=name,
+                    user_phone=user_phone,
+                    violation_type="Gecikmə - çıxış vaxtı keçib",
+                    details=f"Çıxış {CHECKOUT_DEADLINE_HOUR}:00-dan sonra vurulmağa cəhd edildi. Cari vaxt: {now.strftime('%H:%M')}" ,
+                )
+            return
 
         if action == "checkin":
             # Qayda 1: GPS aktivdir? (Koordinatlar düzgündürmü?)
