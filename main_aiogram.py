@@ -2870,6 +2870,18 @@ async def handle_cixis(message: Message) -> None:
             pending_action.pop(user_id, None)
             return
         else:
+            try:
+                start_time = parse_dt_to_baku(sess["start_time"])  # type: ignore[index]
+                today = today_baku()
+                if start_time.date().isoformat() != today:
+                    await message.answer(
+                        "❌ Bu gün giriş etmədiyiniz üçün çıxış edə bilmirsiniz. Əvvəlcə giriş edin.",
+                        reply_markup=worker_keyboard(),
+                    )
+                    pending_action.pop(user_id, None)
+                    return
+            except Exception:
+                pass
             # Early safeguard: do not even prompt for location if minimum work duration not passed
             try:
                 start_time = parse_dt_to_baku(sess["start_time"])  # type: ignore[index]
@@ -3184,6 +3196,18 @@ async def handle_location(message: Message) -> None:
                 )
                 pending_action.pop(user_id, None)
                 return
+
+            try:
+                start_time = parse_dt_to_baku(sess["start_time"])  # type: ignore[index]
+                if start_time.date().isoformat() != today:
+                    await message.answer(
+                        "❌ Bu gün giriş etmədiyiniz üçün çıxış edə bilmirsiniz. Əvvəlcə giriş edin.",
+                        reply_markup=worker_keyboard(),
+                    )
+                    pending_action.pop(user_id, None)
+                    return
+            except Exception:
+                pass
             
             # Bu gün üçün artıq çıxış vurulubmu yoxlayırıq
             today_sess = db.get_user_session_on_date(uid, today)
@@ -3251,14 +3275,14 @@ async def handle_location(message: Message) -> None:
             
             # Qayda 5 (praktika): Giriş-çıxış eyni nöqtə məhdudiyyəti tətbiq edilmir.
             
-            # Qayda 6: Məkəndədir?
-            dist_from_workplace = haversine_m(WORKPLACE_LAT, WORKPLACE_LON, lat, lon)
-            if dist_from_workplace > WORKPLACE_RADIUS_M:
+            # Qayda 6: Çıxış giriş lokasiyasına yaxın olmalıdır
+            dist_from_start = dist_m
+            if dist_from_start > WORKPLACE_RADIUS_M:
                 await message.answer(
-                    f"❌ Çıxış məkandan kənar vurula bilməz.\n\n"
-                    f"📍 Məkan radiusu: {WORKPLACE_RADIUS_M} metr\n"
-                    f"📍 Sizin məsafəniz: {int(dist_from_workplace)} metr\n\n"
-                    f"Zəhmət olmasa məkan daxilində olun.",
+                    f"❌ Çıxış giriş nöqtəsindən uzaqda vurula bilməz.\n\n"
+                    f"📍 Radius: {WORKPLACE_RADIUS_M} metr\n"
+                    f"📍 Məsafə (giriş → çıxış): {int(dist_from_start)} metr\n\n"
+                    f"Zəhmət olmasa giriş etdiyiniz məkana yaxın olun.",
                     reply_markup=worker_keyboard()
                 )
                 pending_action.pop(user_id, None)
@@ -3272,7 +3296,7 @@ async def handle_location(message: Message) -> None:
                         user_name=name,
                         user_phone=user_phone,
                         violation_type="Məkandan kənar çıxış cəhdi",
-                        details=f"Lokasiya: {lat}, {lon}. Məsafə: {int(dist_from_workplace)} metr (Maksimum: {WORKPLACE_RADIUS_M} metr)"
+                        details=f"Lokasiya: {lat}, {lon}. Məsafə (giriş→çıxış): {int(dist_from_start)} metr (Maksimum: {WORKPLACE_RADIUS_M} metr)"
                     )
                 return
             db.close_session(
