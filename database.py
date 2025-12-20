@@ -1019,7 +1019,10 @@ def get_group_codes(date: Optional[str] = None, only_active: Optional[bool] = No
             if active_on:
                 conds.append('date <= ?')
                 params.append(active_on)
-                conds.append('(expires_at >= ? OR expires_at IS NULL OR expires_at = "")')
+                if _USING_POSTGRES:
+                    conds.append('(expires_at >= ? OR expires_at IS NULL)')
+                else:
+                    conds.append("(expires_at >= ? OR expires_at IS NULL OR expires_at = '')")
                 params.append(active_on)
             if only_active is True:
                 conds.append('is_active = {active}'.format(active='TRUE' if _USING_POSTGRES else '1'))
@@ -1050,7 +1053,10 @@ def get_codes_for(profession: str, date: Optional[str] = None, only_active: bool
             if only_active:
                 query += ' AND is_active = {active}'.format(active='TRUE' if _USING_POSTGRES else '1')
                 today_iso = datetime.now().date().isoformat()
-                query += ' AND date <= ? AND (expires_at >= ? OR expires_at IS NULL OR expires_at = "")'
+                if _USING_POSTGRES:
+                    query += ' AND date <= ? AND (expires_at >= ? OR expires_at IS NULL)'
+                else:
+                    query += " AND date <= ? AND (expires_at >= ? OR expires_at IS NULL OR expires_at = '')"
                 params.extend([today_iso, today_iso])
             query += ' ORDER BY date DESC, code'
             cursor.execute(query, tuple(params))
@@ -1074,8 +1080,10 @@ def is_group_code_valid(profession: str, code: str, on_date: Optional[str] = Non
         try:
             cursor = conn.cursor()
             cursor.execute('PRAGMA busy_timeout=5000')
+            expires_cond = '(expires_at >= ? OR expires_at IS NULL)' if _USING_POSTGRES else "(expires_at >= ? OR expires_at IS NULL OR expires_at = '')"
             cursor.execute(
-                'SELECT 1 FROM group_codes WHERE profession = ? AND code = ? AND date <= ? AND (expires_at >= ? OR expires_at IS NULL OR expires_at = "") AND is_active = {active} LIMIT 1'.format(
+                'SELECT 1 FROM group_codes WHERE profession = ? AND code = ? AND date <= ? AND {expires_cond} AND is_active = {active} LIMIT 1'.format(
+                    expires_cond=expires_cond,
                     active='TRUE' if _USING_POSTGRES else '1'
                 ),
                 (profession, code, on_date, on_date)
